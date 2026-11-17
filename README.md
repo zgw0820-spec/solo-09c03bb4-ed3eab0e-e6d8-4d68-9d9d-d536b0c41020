@@ -107,6 +107,69 @@ pending ──POST──> in_flight ──网关 202 accepted──> accepted   
 | GET | `/alarms` | 列出告警，可按 `status` 过滤 |
 | GET | `/health` | 健康检查 |
 
+### 在线恢复点（热备份）
+
+服务**继续收警、投递与确认**的同时，可随时生成一份可实际恢复的 SQLite 快照：
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| POST | `/recovery-points` | 触发一次在线快照，核验通过后返回元数据（201） |
+| GET | `/recovery-points` | 列出全部已核验、可下载的恢复点（按时间倒序） |
+| GET | `/recovery-points/{snapshot_id}` | 查询单个恢复点的核验信息与 SHA-256 |
+| GET | `/recovery-points/{snapshot_id}/download` | 下载已核验的 SQLite 快照文件 |
+
+实现与一致性保证：
+
+- 基于 SQLite **在线 backup API**（`Connection.backup`），按小批量分页复制，页批之间
+  让出写锁。复制期间 `POST /alarms`、投递回执、确认等短事务照常提交，互不阻塞。
+- 快照是**一个串行化的已提交时点**：某条告警与其通知号、网关受理时间
+  （`primary_accepted_at`）、确认期限（`primary_ack_deadline_at`）要么一起在快照内、
+  要么都不在，绝不出现跨事务的撕裂状态；WAL 中已提交但尚未 checkpoint 的帧同样包含在内。
+- 先写入 `SNAPSHOT_DIR/.staging` 暂存区，再用**独立只读连接**核验：
+  `PRAGMA integrity_check`、`PRAGMA foreign_key_check`、必备表、引用完整性
+  （通知/事件不允许成为孤儿、每告警每角色至多一条通知），并计算 SHA-256。
+  只有全部通过才原子移动到可下载目录并写入 `.json` 元数据 sidecar。
+- 写入或核验失败只删除暂存半成品，**不发布、不可下载，也不触碰在线数据库**；
+  接口返回 409（已有快照在进行中）或 500（写入/核验失败）。
+- 进程内串行化快照（同时只允许一个），保留最近 `SNAPSHOT_RETENTION` 份（默认 10）。
+
+### 用快照恢复并用 Docker Compose 启动
+
+恢复**只覆盖快照时点已提交的告警**，之后新提交的告警不在其中。恢复步骤：
+
+```bash
+# 1) 在仍运行（或临时拉起）的 API 上创建并下载一个已核验恢复点
+curl -X POST localhost:8000/recovery-points            # 记下 snapshot_id 与 sha256
+curl -OJ localhost:8000/recovery-points/<snapshot_id>/download
+
+# 2) 停掉 API（网关保持运行，保留其受理记录）
+docker compose stop api
+
+# 3) 在宿主机核验并把快照恢复到一个新库（脚本只读快照、校验通过才落盘）
+python -I scripts/restore_snapshot.py \
+  --snapshot-file snap-<id>.db \
+  --target ./restore/alarms.db \
+  --expected-sha256 <元数据中的 sha256>
+# 也支持直接从 API 下载：--snapshot-url http://localhost:8000/recovery-points/<id>/download
+
+# 4) 用恢复库覆盖 api-data 卷中的 /srv/data/alarms.db（旧库保留为 *.bak）
+docker run --rm -v alarm_api-data:/vol -v "$PWD/restore":/src alpine \
+  sh -c 'cp /src/alarms.db /vol/alarms.db && rm -f /vol/alarms.db-wal /vol/alarms.db-shm'
+
+# 5) 重新启动
+docker compose up -d
+```
+
+恢复后的接续语义（与普通重启同一套机制，不依赖任何内存状态）：
+
+- **未决通知沿原通知号处理**：`pending`/`unknown`/`in_flight` 的通知保留其原有
+  `notification_no`。worker 先向**现有网关**按该号核查：网关已受理则直接采纳受理结果，
+  网关无记录则用同一通知号重投（网关按通知号幂等去重）。
+- **已受理的通知不会重复实际投递**：网关侧的去重记录 + 库内通知号幂等，保证最多一次。
+- **主通知期限仍以网关受理时间计算**：恢复不重置时钟，`primary_accepted_at` 与
+  `confirmation_due_at` 沿用快照中记录的网关受理时刻，不会因恢复而凭空延长处理窗口。
+- 快照中不存在的、快照之后才提交的告警不会被恢复。
+
 状态值：`primary_queued`、`primary_sending`、`primary_unconfirmed`、
 `primary_rejected`、`awaiting_confirmation`、`escalated`、`confirmed`、
 `confirmed_after_escalation`。
@@ -175,18 +238,27 @@ curl -s localhost:8000/alarms/DEMO-2 | python3 -m json.tool
 | `NOT_FOUND_MISSES_BEFORE_REPOST` | `3` | 网关连续“无记录”多少次后才重投 |
 | `RECONCILE_ON_READ` | `true` | 查询时是否先向网关核对未知回执（只查不发） |
 | `RECOVER_INFLIGHT_ON_STARTUP` | `true` | 启动时把中断的在途通知转为待查 |
+| `SNAPSHOT_DIR` | `./data/snapshots` | 已核验恢复点与暂存区目录（Compose 中持久化到 `api-data` 卷） |
+| `SNAPSHOT_RETENTION` | `10` | 保留最近多少份已核验快照，超出的自动清理 |
 
 ## 测试
 
 ```bash
-python -m pytest -q                     # 27 个测试，进程内假网关，真实 SQLite 文件
+python -m pytest -q                     # 36 个测试，进程内假网关，真实 SQLite 文件
 API_URL=http://localhost:8000 GATEWAY_URL=http://localhost:9000 \
   python -I scripts/smoke_test.py       # 对真实运行的服务做端到端冒烟
 ```
 
 覆盖：幂等提交与 409、计时起点、确认阻断升级、逾期仅一次、回执不明不升级、
 回执补查不重复投递、重启接续（三种中断点）、确认 vs 到期竞态、慢投递不阻塞、
-拒收处理、在途备班如实披露、Swagger/OpenAPI。
+拒收处理、在途备班如实披露、Swagger/OpenAPI，以及在线恢复点的一致性、并发收警下
+快照可用、半成品不暴露、保留策略与快照恢复后按原通知号接续且不重复投递。
+
+恢复脚本（独立于运行中的 API，使用前请用 `-I`）：
+
+```bash
+python -I scripts/restore_snapshot.py --help
+```
 
 ## 已知限制
 

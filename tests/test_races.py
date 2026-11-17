@@ -96,6 +96,8 @@ async def test_swagger_and_openapi_are_exposed(api: ApiHarness):
     assert "/alarms/{alarm_no}/confirm" in paths
     assert "/alarms/{alarm_no}/notifications" in paths
     assert "/notifications/{notification_no}" in paths
+    assert "/recovery-points" in paths
+    assert "/recovery-points/{snapshot_id}/download" in paths
 
 
 async def test_notification_lookup_by_number(api: ApiHarness):

@@ -25,6 +25,10 @@ services:
       dockerfile: Dockerfile
     environment:
       DATABASE_PATH: /srv/data/alarms.db
+      # Verified recovery points are written here (staging area + published
+      # snapshots) and persisted on the same named volume as the database.
+      SNAPSHOT_DIR: /srv/data/snapshots
+      SNAPSHOT_RETENTION: "10"
       GATEWAY_URL: http://gateway:9000
       # Keep the POST timeout below the gateway's slow-response injection so
       # the "receipt lost" path is reachable during manual testing.

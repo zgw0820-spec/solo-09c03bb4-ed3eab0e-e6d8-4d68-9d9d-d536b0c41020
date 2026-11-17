@@ -59,3 +59,11 @@ class Settings:
     recover_inflight_on_startup: bool = field(
         default_factory=lambda: _bool("RECOVER_INFLIGHT_ON_STARTUP", True)
     )
+    # Directory holding verified, downloadable online recovery point snapshots.
+    # Each snapshot is one self-contained SQLite file plus a ``.json`` sidecar
+    # with its verification metadata; half-finished artifacts never leave the
+    # temporary staging area inside this directory.
+    snapshot_dir: str = field(default_factory=lambda: _str("SNAPSHOT_DIR", "./data/snapshots"))
+    # Keep at most this many verified snapshots; older ones are pruned only after
+    # a new snapshot has been verified and published.
+    snapshot_retention: int = field(default_factory=lambda: _int("SNAPSHOT_RETENTION", 10))

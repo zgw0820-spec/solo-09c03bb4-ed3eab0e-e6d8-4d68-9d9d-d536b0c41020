@@ -5,10 +5,12 @@ Run with: ``uvicorn app.main:app``
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.responses import FileResponse
 
 from . import __version__
 from .config import Settings
@@ -21,8 +23,11 @@ from .models import (
     HealthView,
     NotificationList,
     NotificationView,
+    SnapshotList,
+    SnapshotView,
 )
 from .service import AlarmService, ConflictError, NotFoundError
+from .snapshot import SnapshotError, SnapshotStore
 from .worker import Dispatcher
 
 log = logging.getLogger("alarm")
@@ -60,6 +65,9 @@ async def lifespan(app: FastAPI):
     app.state.service = service
     app.state.gateway = gateway
     app.state.dispatcher = dispatcher
+    app.state.snapshot_store = SnapshotStore(
+        settings.snapshot_dir, retention=settings.snapshot_retention
+    )
     if settings.recover_inflight_on_startup:
         recovered = dispatcher.recover_interrupted()
         if recovered:
@@ -91,6 +99,93 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings or Settings()
+
+    @app.post(
+        "/recovery-points",
+        response_model=SnapshotView,
+        status_code=status.HTTP_201_CREATED,
+        tags=["在线恢复点"],
+        summary="创建在线恢复点（SQLite 快照）",
+        description=(
+            "使用 SQLite 在线 backup API 在**服务继续收警、投递与确认**的同时复制一份"
+            "一致的数据库快照（包含 WAL 中已提交的记录）。快照先写入暂存区，经独立连接"
+            "完整性校验、表内容核对与 SHA-256 计算通过后才原子发布；写入或核验失败只清理"
+            "半成品，不影响原服务，也不会产生可下载文件。返回后该恢复点即可下载。"
+        ),
+        responses={
+            409: {"description": "已有一个快照操作在进行中"},
+            500: {"description": "快照写入或核验失败（未发布任何半成品）"},
+        },
+    )
+    async def create_recovery_point(request: Request) -> dict:
+        store: SnapshotStore = request.app.state.snapshot_store
+        db: Database = request.app.state.db
+        try:
+            record = await asyncio.to_thread(store.create_snapshot, db)
+        except SnapshotError as exc:
+            # A concurrent snapshot is a client-retryable conflict; every other
+            # failure is a server error with the half-finished artifact removed.
+            http_status = 409 if "already in progress" in str(exc) else 500
+            raise HTTPException(status_code=http_status, detail=str(exc)) from exc
+        return record
+
+    @app.get(
+        "/recovery-points",
+        response_model=SnapshotList,
+        tags=["在线恢复点"],
+        summary="列出已核验的恢复点",
+    )
+    async def list_recovery_points(request: Request) -> SnapshotList:
+        store: SnapshotStore = request.app.state.snapshot_store
+        items = store.list_snapshots()
+        return SnapshotList(items=[SnapshotView(**item) for item in items], total=len(items))
+
+    @app.get(
+        "/recovery-points/{snapshot_id}",
+        response_model=SnapshotView,
+        tags=["在线恢复点"],
+        summary="查询单个恢复点的核验信息",
+        responses={404: {"description": "恢复点不存在"}},
+    )
+    async def get_recovery_point(snapshot_id: str, request: Request) -> SnapshotView:
+        store: SnapshotStore = request.app.state.snapshot_store
+        try:
+            record = store.get_snapshot(snapshot_id)
+        except SnapshotError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"recovery point {snapshot_id!r} not found")
+        return SnapshotView(**record)
+
+    @app.get(
+        "/recovery-points/{snapshot_id}/download",
+        tags=["在线恢复点"],
+        summary="下载已核验的 SQLite 快照",
+        description=(
+            "仅返回核验通过并已发布的快照文件（`application/vnd.sqlite3`）。文件名带 "
+            "`attachment`，可直接保存为恢复用的 SQLite 数据库；其 SHA-256 与元数据端点一致。"
+        ),
+        responses={
+            404: {"description": "恢复点不存在或文件缺失"},
+            500: {"description": "恢复点未通过核验，禁止下载"},
+        },
+    )
+    async def download_recovery_point(snapshot_id: str, request: Request) -> FileResponse:
+        store: SnapshotStore = request.app.state.snapshot_store
+        try:
+            path = store.db_path_for_download(snapshot_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=404, detail=f"recovery point {snapshot_id!r} not found"
+            ) from exc
+        except SnapshotError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return FileResponse(
+            path,
+            media_type="application/vnd.sqlite3",
+            filename=path.name,
+            headers={"X-Snapshot-Id": snapshot_id},
+        )
 
     @app.get("/health", response_model=HealthView, tags=["运维"], summary="健康检查")
     def health(request: Request) -> HealthView:

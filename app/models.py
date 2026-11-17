@@ -137,6 +137,35 @@ class NotificationList(BaseModel):
     total: int
 
 
+class SnapshotView(BaseModel):
+    snapshot_id: str = Field(description="Recovery point id, also the download key")
+    status: str = Field(description="Lifecycle state: ready | failed (only verified points are listed)")
+    created_at: str = Field(description="UTC time the online backup started")
+    finished_at: str = Field(description="UTC time verification completed and the point was published")
+    database_file: str = Field(description="File name of the downloadable SQLite snapshot")
+    sha256: str = Field(description="SHA-256 of the published snapshot file")
+    size_bytes: int
+    source_database: str = Field(description="Path of the live database this point was taken from")
+    backup_steps: int = Field(description="Number of online backup page batches")
+    row_counts: dict[str, int] = Field(
+        description="Committed rows per table captured inside the snapshot (alarms, notifications, events)"
+    )
+    source_row_counts: dict[str, int] = Field(
+        description="Rows per table in the live database at verification time"
+    )
+    integrity_check: str = Field(description="Result of PRAGMA integrity_check on the snapshot")
+    foreign_key_check: str = Field(description="Result of PRAGMA foreign_key_check on the snapshot")
+    sqlite_version: str
+    download_available: bool = Field(
+        default=True, description="False only if the published file has gone missing externally"
+    )
+
+
+class SnapshotList(BaseModel):
+    items: list[SnapshotView]
+    total: int
+
+
 class HealthView(BaseModel):
     status: str
     database: str

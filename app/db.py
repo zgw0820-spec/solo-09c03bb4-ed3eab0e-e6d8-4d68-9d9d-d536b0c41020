@@ -140,6 +140,29 @@ class Database:
             else:
                 self._conn.execute("COMMIT")
 
+    @contextmanager
+    def read_transaction(self) -> Iterator[sqlite3.Connection]:
+        """A read-only section serialised against writers of this connection.
+
+        It never starts a write transaction, so it cannot block or be blocked by
+        the online snapshot backup beyond SQLite's own short page-level locks.
+        """
+        with self._lock:
+            yield self._conn
+
+    @contextmanager
+    def backup_lock(self) -> Iterator[sqlite3.Connection]:
+        """Expose the live connection for an online backup while holding the
+        connection's serialising lock.
+
+        The backup API takes its own internal, short-lived SQLite locks per page
+        batch; holding this Python lock keeps this single connection's access
+        ordered without preventing other threads' committed writes from being
+        included in the consistent copy.
+        """
+        with self._lock:
+            yield self._conn
+
     def query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
         with self._lock:
             return list(self._conn.execute(sql, params).fetchall())
